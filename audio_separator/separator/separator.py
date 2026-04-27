@@ -13,7 +13,7 @@ import io
 import re
 import librosa
 import numpy as np
-from typing import Optional
+from typing import Optional, Union
 
 import hashlib
 import json
@@ -121,6 +121,7 @@ class Separator:
         use_soundfile=False,
         use_autocast=False,
         use_directml=False,
+        device: Optional[Union[str, torch.device]] = None,
         chunk_duration=None,
         mdx_params={"hop_length": 1024, "segment_size": 256, "overlap": 0.25, "batch_size": 1, "enable_denoise": False},
         vr_params={"batch_size": 1, "window_size": 512, "aggression": 5, "enable_tta": False, "enable_post_process": False, "post_process_threshold": 0.2, "high_end_process": False},
@@ -212,6 +213,7 @@ class Separator:
         self.use_soundfile = use_soundfile
         self.use_autocast = use_autocast
         self.use_directml = use_directml
+        self._requested_device = device
 
         self.chunk_duration = chunk_duration
         if chunk_duration is not None:
@@ -384,6 +386,33 @@ class Separator:
 
         self.torch_device_cpu = torch.device("cpu")
 
+        if self._requested_device is not None:
+            req = self._requested_device
+            torch_dev = req if isinstance(req, torch.device) else torch.device(req)
+            if torch_dev.type == "cpu":
+                self.logger.info(f"Using requested device: {torch_dev}")
+                self.torch_device = self.torch_device_cpu
+                self.onnx_execution_provider = ["CPUExecutionProvider"]
+                return
+            if torch_dev.type == "cuda":
+                if not torch.cuda.is_available():
+                    raise ValueError(f"CUDA device {torch_dev} was requested but CUDA is not available.")
+                device_index = torch_dev.index if torch_dev.index is not None else 0
+                if device_index >= torch.cuda.device_count():
+                    raise ValueError(
+                        f"CUDA device index {device_index} is invalid; only {torch.cuda.device_count()} CUDA device(s) available."
+                    )
+                self.configure_cuda(ort_providers, cuda_device=torch_dev)
+                return
+            if torch_dev.type == "mps":
+                if not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
+                    raise ValueError("MPS device was requested but MPS is not available.")
+                self.configure_mps(ort_providers)
+                return
+            raise ValueError(
+                f"Unsupported device {torch_dev}. Use 'cpu', 'cuda', 'cuda:N' (e.g. 'cuda:0', 'cuda:1'), or 'mps'."
+            )
+
         if torch.cuda.is_available():
             self.configure_cuda(ort_providers)
             hardware_acceleration_enabled = True
@@ -401,15 +430,20 @@ class Separator:
             self.torch_device = self.torch_device_cpu
             self.onnx_execution_provider = ["CPUExecutionProvider"]
 
-    def configure_cuda(self, ort_providers):
+    def configure_cuda(self, ort_providers, cuda_device=None):
         """
         This method configures the CUDA device for PyTorch and ONNX Runtime, if available.
+
+        cuda_device: torch.device for CUDA (e.g. cuda:0, cuda:1). Defaults to the primary CUDA device.
         """
-        self.logger.info("CUDA is available in Torch, setting Torch device to CUDA")
-        self.torch_device = torch.device("cuda")
+        if cuda_device is None:
+            cuda_device = torch.device("cuda")
+        self.logger.info(f"CUDA is available in Torch, setting Torch device to {cuda_device}")
+        self.torch_device = cuda_device
+        device_id = cuda_device.index if cuda_device.index is not None else 0
         if "CUDAExecutionProvider" in ort_providers:
             self.logger.info("ONNXruntime has CUDAExecutionProvider available, enabling acceleration")
-            self.onnx_execution_provider = ["CUDAExecutionProvider"]
+            self.onnx_execution_provider = [("CUDAExecutionProvider", {"device_id": device_id})]
         else:
             self.logger.warning("CUDAExecutionProvider not available in ONNXruntime, so acceleration will NOT be enabled")
 
@@ -1330,22 +1364,11 @@ class Separator:
                     self.logger.info(f"Ensembling {len(stem_paths)} stems for type: {stem_name}")
 
                     waveforms = []
-                    original_channels = None
                     for sp in stem_paths:
-                        wav, _ = librosa.load(sp, mono=False, sr=self.sample_rate)
-                        if wav.ndim == 1:
-                            if original_channels is None:
-                                original_channels = 1
-                            wav = np.asfortranarray([wav, wav])
-                        elif original_channels is None:
-                            original_channels = wav.shape[0]
-                        waveforms.append(wav)
+                        wav, _ = librosa.load(sp, mono=True, sr=self.sample_rate)
+                        waveforms.append(np.expand_dims(wav, 0))
 
                     ensembled_wav = ensembler.ensemble(waveforms)
-
-                    # Restore original channel count (avoid fake stereo from mono input)
-                    if original_channels == 1 and ensembled_wav.shape[0] > 1:
-                        ensembled_wav = ensembled_wav[:1, :]
 
                     # Determine output filename
                     if custom_output_names and stem_name in custom_output_names:
@@ -1387,12 +1410,14 @@ class Separator:
                         import soundfile as sf
 
                         try:
+                            ensemble_mono = np.squeeze(ensembled_wav, axis=0)
                             self.logger.debug(f"Attempting to write ensembled audio to {final_output_path}...")
-                            sf.write(final_output_path, ensembled_wav.T, self.sample_rate)
+                            sf.write(final_output_path, ensemble_mono, self.sample_rate)
                         except Exception as e:
                             self.logger.error(f"Error writing {self.output_format} format: {e}. Falling back to WAV.")
                             final_output_path = final_output_path.rsplit(".", 1)[0] + ".wav"
-                            sf.write(final_output_path, ensembled_wav.T, self.sample_rate)
+                            ensemble_mono = np.squeeze(ensembled_wav, axis=0)
+                            sf.write(final_output_path, ensemble_mono, self.sample_rate)
 
                         output_files.append(final_output_path)
 

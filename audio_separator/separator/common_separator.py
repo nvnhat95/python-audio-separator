@@ -281,6 +281,33 @@ class CommonSeparator:
         self.logger.debug("Mix preparation completed.")
         return mix
 
+    def _waveform_to_mono_output(self, wave):
+        """Collapse stereo/multichannel waveforms to mono by averaging channels."""
+        if wave is None:
+            return wave
+        w = np.asarray(wave)
+        if w.ndim == 1:
+            return w
+        if w.ndim != 2:
+            self.logger.warning(f"Unexpected waveform shape {w.shape}; taking mean over last axis.")
+            return np.mean(w, axis=-1)
+
+        # (samples, channels): second dim is channel count (typically 2; small vs. long first dim).
+        if w.shape[1] <= 8 and w.shape[1] < w.shape[0]:
+            out = np.mean(w, axis=1)
+            self.logger.debug(f"Mixed multichannel stem to mono: {w.shape} → {out.shape}")
+            return out
+
+        # (channels, samples): first dim is channel count.
+        if w.shape[0] <= 8 and w.shape[0] < w.shape[1]:
+            out = np.mean(w, axis=0)
+            self.logger.debug(f"Mixed multichannel stem to mono: {w.shape} → {out.shape}")
+            return out
+
+        out = np.mean(w, axis=0)
+        self.logger.debug(f"Averaged ambiguous layout to mono: {w.shape} → {out.shape}")
+        return out
+
     def write_audio(self, stem_path: str, stem_source):
         """
         Writes the separated audio source to a file using pydub or soundfile
@@ -307,6 +334,7 @@ class CommonSeparator:
         self.logger.debug(f"Entering write_audio_pydub with stem_path: {stem_path}")
 
         stem_source = spec_utils.normalize(wave=stem_source, max_peak=self.normalization_threshold, min_peak=self.amplification_threshold)
+        stem_source = self._waveform_to_mono_output(stem_source)
 
         # Check if the numpy array is empty or contains very low values
         if np.max(np.abs(stem_source)) < 1e-6:
@@ -331,16 +359,16 @@ class CommonSeparator:
             stem_source = (stem_source * 32767).astype(np.int16)
             self.logger.debug("Converted stem_source to int16 for pydub processing.")
 
-        # Correctly interleave stereo channels
-        stem_source_interleaved = np.empty((2 * stem_source.shape[0],), dtype=np.int16)
-        stem_source_interleaved[0::2] = stem_source[:, 0]  # Left channel
-        stem_source_interleaved[1::2] = stem_source[:, 1]  # Right channel
+        if stem_source.ndim != 1:
+            self.logger.warning(f"Expected mono 1D PCM after conversion, got shape {stem_source.shape}; flattening.")
+            stem_source = stem_source.reshape(-1)
 
-        self.logger.debug(f"Interleaved audio data shape: {stem_source_interleaved.shape}")
+        pcm_bytes = stem_source.tobytes()
+        self.logger.debug(f"Mono PCM bytes length: {len(pcm_bytes)}")
 
         # Create a pydub AudioSegment (always from 16-bit data)
         try:
-            audio_segment = AudioSegment(stem_source_interleaved.tobytes(), frame_rate=self.sample_rate, sample_width=2, channels=2)
+            audio_segment = AudioSegment(pcm_bytes, frame_rate=self.sample_rate, sample_width=2, channels=1)
             self.logger.debug("Created AudioSegment successfully.")
         except (IOError, ValueError) as e:
             self.logger.error(f"Specific error creating AudioSegment: {e}")
@@ -395,6 +423,7 @@ class CommonSeparator:
         self.logger.debug(f"Entering write_audio_soundfile with stem_path: {stem_path}")
 
         stem_source = spec_utils.normalize(wave=stem_source, max_peak=self.normalization_threshold, min_peak=self.amplification_threshold)
+        stem_source = self._waveform_to_mono_output(stem_source)
 
         # Check if the numpy array is empty or contains very low values
         if np.max(np.abs(stem_source)) < 1e-6:
@@ -427,17 +456,7 @@ class CommonSeparator:
             output_subtype = 'PCM_16'
             self.logger.warning("No bit depth info available, defaulting to PCM_16")
 
-        # Correctly interleave stereo channels if needed
-        if stem_source.shape[1] == 2:
-            # If the audio is already interleaved, ensure it's in the correct order
-            # Check if the array is Fortran contiguous (column-major)
-            if stem_source.flags["F_CONTIGUOUS"]:
-                # Convert to C contiguous (row-major)
-                stem_source = np.ascontiguousarray(stem_source)
-            # No need to manually interleave for soundfile - it handles multi-channel properly
-            # Just ensure we don't have the wrong shape
-
-        self.logger.debug(f"Audio data shape for soundfile: {stem_source.shape}")
+        self.logger.debug(f"Audio data shape for soundfile (mono): {stem_source.shape}")
 
         """
         Write audio using soundfile (for formats other than M4A).
