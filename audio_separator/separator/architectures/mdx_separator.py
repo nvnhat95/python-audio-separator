@@ -159,9 +159,9 @@ class MDXSeparator(CommonSeparator):
         source = self.demix(mix) * peak
         self.logger.debug("Demixing completed.")
 
-
         if not isinstance(self.primary_source, np.ndarray):
             self.primary_source = source.T
+        del source
 
         # In UVR, the source is cached here if it's a vocal split model, but we're not supporting that yet
 
@@ -169,16 +169,17 @@ class MDXSeparator(CommonSeparator):
         output_files = []
         self.logger.debug("Processing output files...")
 
-        # Process the secondary source if not already an array
-        if not isinstance(self.secondary_source, np.ndarray):
-            self.logger.debug("Producing secondary source: demixing in match_mix mode")
-            raw_mix = self.demix(mix, is_match_mix=True)
+        need_secondary_stem = not self.output_single_stem or self.output_single_stem.lower() == self.secondary_stem_name.lower()
 
+        # Skip secondary construction entirely when only the primary stem is requested (saves a full demix pass and large buffers).
+        if need_secondary_stem and not isinstance(self.secondary_source, np.ndarray):
             if self.invert_using_spec:
+                self.logger.debug("Producing secondary source: demixing in match_mix mode (invert_using_spec)")
+                raw_mix = self.demix(mix, is_match_mix=True)
                 self.logger.debug("Inverting secondary stem using spectogram as invert_using_spec is set to True")
                 self.secondary_source = spec_utils.invert_stem(raw_mix, self.primary_source * self.compensate)
             else:
-                self.logger.debug("Inverting secondary stem by subtracting of transposed demixed stem from transposed original mix")
+                self.logger.debug("Producing secondary stem from mix minus primary (skipping match_mix demix)")
                 self.secondary_source = (-self.primary_source * self.compensate) + mix.T
 
         # Save and process the secondary stem if needed

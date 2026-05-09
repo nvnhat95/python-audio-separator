@@ -13,6 +13,7 @@ import io
 import re
 import librosa
 import numpy as np
+import soundfile as sf
 from typing import Optional, Union
 
 import hashlib
@@ -69,11 +70,15 @@ class Separator:
         output_bitrate (str): The bitrate of the output audio file.
         amplification_threshold (float): The threshold for audio amplification.
         normalization_threshold (float): The threshold for audio normalization.
-        output_single_stem (str): Option to output a single stem.
+        output_single_stem (str): If set, only that stem is written. Use the model's primary or secondary stem name (e.g. Vocals, Instrumental). For MDX this skips the second demix and secondary buffers when you only request the primary stem; for MDXC it skips normalizing unused stems where possible.
         invert_using_spec (bool): Flag to invert using spectrogram.
         sample_rate (int): The sample rate of the audio.
         use_soundfile (bool): Use soundfile for audio writing, can solve OOM issues.
         use_autocast (bool): Flag to use PyTorch autocast for faster inference.
+        large_file_memory_threshold_bytes (int | None): If set, files whose estimated float32 stereo buffer at ``sample_rate``
+            exceeds this size are split into ``auto_chunk_segment_seconds`` segments automatically (SoundFile streaming split).
+            ``None`` disables automatic chunking (default threshold ~384 MiB).
+        auto_chunk_segment_seconds (float): Segment length when automatic large-file chunking triggers (default 30 minutes).
 
     MDX Architecture Specific Attributes:
         hop_length (int): The hop length for STFT.
@@ -123,6 +128,8 @@ class Separator:
         use_directml=False,
         device: Optional[Union[str, torch.device]] = None,
         chunk_duration=None,
+        large_file_memory_threshold_bytes: Optional[int] = 384 * 1024 * 1024,
+        auto_chunk_segment_seconds: float = 1800.0,
         mdx_params={"hop_length": 1024, "segment_size": 256, "overlap": 0.25, "batch_size": 1, "enable_denoise": False},
         vr_params={"batch_size": 1, "window_size": 512, "aggression": 5, "enable_tta": False, "enable_post_process": False, "post_process_threshold": 0.2, "high_end_process": False},
         demucs_params={"segment_size": "Default", "shifts": 2, "overlap": 0.25, "segments_enabled": True},
@@ -219,6 +226,11 @@ class Separator:
         if chunk_duration is not None:
             if chunk_duration <= 0:
                 raise ValueError("chunk_duration must be greater than 0")
+
+        self.large_file_memory_threshold_bytes = large_file_memory_threshold_bytes
+        self.auto_chunk_segment_seconds = auto_chunk_segment_seconds
+        if auto_chunk_segment_seconds <= 0:
+            raise ValueError("auto_chunk_segment_seconds must be greater than 0")
 
         self.ensemble_algorithm = ensemble_algorithm
         self.ensemble_weights = ensemble_weights
@@ -1022,6 +1034,21 @@ class Separator:
 
         return output_files
 
+    def _estimate_prepare_mix_ram_bytes(self, audio_file_path: str) -> Optional[int]:
+        """
+        Approximate bytes for a stereo float32 mix at ``sample_rate`` (same order as ``prepare_mix`` output).
+        Used to decide automatic file chunking before ``librosa.load`` allocates the full waveform.
+        """
+        try:
+            info = sf.info(audio_file_path)
+        except Exception:
+            return None
+        if info.frames <= 0:
+            return 0
+        duration_s = info.frames / float(info.samplerate)
+        channels = max(2, info.channels)
+        return int(duration_s * self.sample_rate * channels * np.dtype(np.float32).itemsize)
+
     def _separate_file(self, audio_file_path, custom_output_names=None):
         """
         Internal method to handle separation for a single audio file.
@@ -1033,17 +1060,30 @@ class Separator:
         Returns:
         - output_files (list of str): A list containing the paths to the separated audio stem files.
         """
-        # Check if chunking is enabled and file is large enough
-        if self.chunk_duration is not None:
-            import librosa
+        from audio_separator.separator.audio_chunking import AudioChunker
+
+        effective_chunk = self.chunk_duration
+        if effective_chunk is None and self.large_file_memory_threshold_bytes is not None:
+            est = self._estimate_prepare_mix_ram_bytes(audio_file_path)
+            if est is not None and est > self.large_file_memory_threshold_bytes:
+                effective_chunk = self.auto_chunk_segment_seconds
+                self.logger.warning(
+                    f"Estimated in-memory decode ~{est / (1024 ** 2):.0f} MiB exceeds "
+                    f"{self.large_file_memory_threshold_bytes / (1024 ** 2):.0f} MiB; splitting into {effective_chunk:g}s "
+                    f"chunks (streaming). Set large_file_memory_threshold_bytes=None on Separator to load the full file instead."
+                )
+
+        if effective_chunk is not None:
             duration = librosa.get_duration(path=audio_file_path)
-
-            from audio_separator.separator.audio_chunking import AudioChunker
-            chunker = AudioChunker(self.chunk_duration, self.logger)
-
+            chunker = AudioChunker(effective_chunk, self.logger)
             if chunker.should_chunk(duration):
-                self.logger.info(f"File duration {duration:.1f}s exceeds chunk size {self.chunk_duration}s, using chunked processing")
-                return self._process_with_chunking(audio_file_path, custom_output_names)
+                if self.chunk_duration is not None:
+                    self.logger.info(
+                        f"File duration {duration:.1f}s exceeds chunk size {self.chunk_duration}s, using chunked processing"
+                    )
+                return self._process_with_chunking(
+                    audio_file_path, custom_output_names, chunk_duration_seconds=effective_chunk
+                )
 
         # Log the start of the separation process
         self.logger.info(f"Starting separation process for audio_file_path: {audio_file_path}")
@@ -1078,7 +1118,7 @@ class Separator:
 
         return output_files
 
-    def _process_with_chunking(self, audio_file_path, custom_output_names=None):
+    def _process_with_chunking(self, audio_file_path, custom_output_names=None, chunk_duration_seconds=None):
         """
         Process large file by splitting into chunks.
 
@@ -1089,6 +1129,7 @@ class Separator:
         Parameters:
         - audio_file_path (str): The path to the audio file.
         - custom_output_names (dict, optional): Custom names for the output files. Defaults to None.
+        - chunk_duration_seconds (float, optional): Chunk length in seconds; defaults to ``Separator.chunk_duration``.
 
         Returns:
         - output_files (list of str): A list containing the paths to the separated audio stem files.
@@ -1097,13 +1138,15 @@ class Separator:
         import shutil
         from audio_separator.separator.audio_chunking import AudioChunker
 
+        chunk_sec = float(chunk_duration_seconds if chunk_duration_seconds is not None else self.chunk_duration)
+
         # Create temporary directory for chunks
         temp_dir = tempfile.mkdtemp(prefix="audio-separator-chunks-")
         self.logger.debug(f"Created temporary directory for chunks: {temp_dir}")
 
         try:
             # Split audio into chunks
-            chunker = AudioChunker(self.chunk_duration, self.logger)
+            chunker = AudioChunker(chunk_sec, self.logger)
             chunk_paths = chunker.split_audio(audio_file_path, temp_dir)
 
             # Process each chunk
@@ -1112,11 +1155,12 @@ class Separator:
             for i, chunk_path in enumerate(chunk_paths):
                 self.logger.info(f"Processing chunk {i+1}/{len(chunk_paths)}: {chunk_path}")
 
-                original_chunk_duration = self.chunk_duration
+                saved_chunk_duration = self.chunk_duration
                 original_output_dir = self.output_dir
                 self.chunk_duration = None
                 self.output_dir = temp_dir
 
+                original_model_output_dir = None
                 if self.model_instance:
                     original_model_output_dir = self.model_instance.output_dir
                     self.model_instance.output_dir = temp_dir
@@ -1148,7 +1192,7 @@ class Separator:
                         self.logger.warning(f"Chunk {i+1} produced no output files")
 
                 finally:
-                    self.chunk_duration = original_chunk_duration
+                    self.chunk_duration = saved_chunk_duration
                     self.output_dir = original_output_dir
                     if self.model_instance:
                         self.model_instance.output_dir = original_model_output_dir

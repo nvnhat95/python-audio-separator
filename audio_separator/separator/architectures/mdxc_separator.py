@@ -183,7 +183,10 @@ class MDXCSeparator(CommonSeparator):
                     output_files.append(stem_output_path)
             else:
                 # Standard processing for primary and secondary stems
-                if not isinstance(self.primary_source, np.ndarray):
+                need_primary_stem = not self.output_single_stem or self.output_single_stem.lower() == self.primary_stem_name.lower()
+                need_secondary_stem = not self.output_single_stem or self.output_single_stem.lower() == self.secondary_stem_name.lower()
+
+                if need_primary_stem and not isinstance(self.primary_source, np.ndarray):
                     self.logger.debug(f"Normalizing primary source for primary stem {self.primary_stem_name}...")
                     self.primary_source = spec_utils.normalize(
                         wave=source[self.primary_stem_name], 
@@ -191,7 +194,7 @@ class MDXCSeparator(CommonSeparator):
                         min_peak=self.amplification_threshold
                     ).T
 
-                if not isinstance(self.secondary_source, np.ndarray):
+                if need_secondary_stem and not isinstance(self.secondary_source, np.ndarray):
                     self.logger.debug(f"Normalizing secondary source for secondary stem {self.secondary_stem_name}...")
                     self.secondary_source = spec_utils.normalize(
                         wave=source[self.secondary_stem_name], 
@@ -458,11 +461,11 @@ class MDXCSeparator(CommonSeparator):
                 # Ensure shapes match before residual subtraction
                 if primary.shape[1] != orig_mix.shape[1]:
                     primary = spec_utils.match_array_shapes(primary, orig_mix)
-                secondary = orig_mix - primary
-                return {
-                    self.primary_stem_name: primary,
-                    self.secondary_stem_name: secondary,
-                }
+                out = {self.primary_stem_name: primary}
+                need_secondary = not self.output_single_stem or self.output_single_stem.lower() == self.secondary_stem_name.lower()
+                if need_secondary:
+                    out[self.secondary_stem_name] = orig_mix - primary
+                return out
 
             self.logger.debug("Returning inferenced output for single instrument")
             return primary
