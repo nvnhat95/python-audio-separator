@@ -9,6 +9,7 @@ import tempfile
 import logging
 from unittest.mock import Mock, patch, MagicMock
 from pydub import AudioSegment
+import soundfile as sf
 
 from audio_separator.separator.audio_chunking import AudioChunker
 
@@ -54,10 +55,11 @@ class TestAudioChunker:
         # File duration 10.1 seconds, chunk duration 10 seconds
         assert self.chunker.should_chunk(10.1) is True
 
+    @patch.object(AudioChunker, "_merge_short_final_chunk_into_previous")
     @patch('audio_separator.separator.audio_chunking.AudioSegment.from_file')
     @patch('audio_separator.separator.audio_chunking.os.path.exists')
     @patch('audio_separator.separator.audio_chunking.os.makedirs')
-    def test_split_audio_basic(self, _mock_makedirs, mock_exists, mock_from_file):
+    def test_split_audio_basic(self, _mock_makedirs, mock_exists, mock_from_file, _mock_merge_tail):
         """Test basic audio splitting."""
         # Mock audio file (30 seconds)
         mock_audio = Mock()
@@ -71,7 +73,7 @@ class TestAudioChunker:
         try:
             chunk_paths = self.chunker.split_audio("test.wav", temp_dir)
 
-            # Should create 3 chunks (30s / 10s = 3)
+            # Should create 3 chunks (30s / 10s = 3); tail merge skipped (mocked, no real files)
             assert len(chunk_paths) == 3
             assert all("chunk_" in path for path in chunk_paths)
             assert mock_audio.export.call_count == 3
@@ -82,10 +84,11 @@ class TestAudioChunker:
             if os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir)
 
+    @patch.object(AudioChunker, "_merge_short_final_chunk_into_previous")
     @patch('audio_separator.separator.audio_chunking.AudioSegment.from_file')
     @patch('audio_separator.separator.audio_chunking.os.path.exists')
     @patch('audio_separator.separator.audio_chunking.os.makedirs')
-    def test_split_audio_uneven_chunks(self, _mock_makedirs, mock_exists, mock_from_file):
+    def test_split_audio_uneven_chunks(self, _mock_makedirs, mock_exists, mock_from_file, _mock_merge_tail):
         """Test splitting audio with uneven chunk sizes."""
         # Mock audio file (25 seconds)
         mock_audio = Mock()
@@ -99,8 +102,7 @@ class TestAudioChunker:
         try:
             chunk_paths = self.chunker.split_audio("test.wav", temp_dir)
 
-            # Should create 3 chunks (ceil(25s / 10s) = 3)
-            # First two chunks: 10s each, last chunk: 5s
+            # Should create 3 chunks (ceil(25s / 10s) = 3); tail merge skipped (mocked)
             assert len(chunk_paths) == 3
 
         finally:
@@ -183,8 +185,8 @@ class TestAudioChunkerIntegration:
             chunk_dir = os.path.join(temp_dir, "chunks")
             chunk_paths = chunker.split_audio(input_path, chunk_dir)
 
-            # Should create 3 chunks
-            assert len(chunk_paths) == 3
+            # Three 5s segments, then 5s tail merged into the prior 5s → two files
+            assert len(chunk_paths) == 2
             assert all(os.path.exists(path) for path in chunk_paths)
 
             # Merge
@@ -204,6 +206,30 @@ class TestAudioChunkerIntegration:
             if os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir)
 
+    def test_short_final_chunk_merged_with_real_audio(self):
+        """Final segment under 5 minutes is folded into the previous chunk file."""
+        audio = AudioSegment.silent(duration=65_000)  # 65s
+
+        temp_dir = tempfile.mkdtemp()
+        try:
+            input_path = os.path.join(temp_dir, "in.wav")
+            audio.export(input_path, format="wav")
+
+            chunker = AudioChunker(30.0)  # 30s chunks → 30 + 30 + 5s then merge tail
+            chunk_dir = os.path.join(temp_dir, "chunks")
+            chunk_paths = chunker.split_audio(input_path, chunk_dir)
+
+            assert len(chunk_paths) == 2
+            d0, sr0 = sf.read(chunk_paths[0], dtype="float32", always_2d=True)
+            d1, sr1 = sf.read(chunk_paths[1], dtype="float32", always_2d=True)
+            assert sr0 == sr1
+            assert abs(d0.shape[0] / sr0 - 30.0) < 0.2
+            assert abs(d1.shape[0] / sr1 - 35.0) < 0.2
+        finally:
+            import shutil
+            if os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir)
+
     def test_split_with_different_formats(self):
         """Test splitting works with different audio formats."""
         audio = AudioSegment.silent(duration=10000)  # 10 seconds
@@ -218,7 +244,8 @@ class TestAudioChunkerIntegration:
             chunk_dir = os.path.join(temp_dir, "chunks_wav")
             chunk_paths = chunker.split_audio(input_wav, chunk_dir)
 
-            assert len(chunk_paths) == 2
+            # Two 5s halves merged into one 10s segment
+            assert len(chunk_paths) == 1
             assert all(path.endswith(".wav") for path in chunk_paths)
 
         finally:
@@ -266,8 +293,8 @@ class TestAudioChunkerEdgeCases:
             chunk_dir = os.path.join(temp_dir, "chunks")
             chunk_paths = chunker.split_audio(input_path, chunk_dir)
 
-            # Should create exactly 2 chunks
-            assert len(chunk_paths) == 2
+            # Two equal 10s chunks; second merged into first (tail under 5 min)
+            assert len(chunk_paths) == 1
 
         finally:
             import shutil

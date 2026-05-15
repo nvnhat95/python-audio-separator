@@ -4,6 +4,7 @@ import os
 import logging
 from typing import List, Optional
 
+import numpy as np
 import soundfile as sf
 from pydub import AudioSegment
 
@@ -29,11 +30,76 @@ class AudioChunker:
     """
 
     _STREAM_READ_FRAMES = 262144
+    # If the final segment is shorter than this, fold it into the previous chunk (avoids empty / unusable tails).
+    _MIN_LAST_CHUNK_SECONDS = 300.0
 
     @staticmethod
     def _soundfile_format_for_path(path: str) -> str:
         _, ext = os.path.splitext(path)
         return {".wav": "WAV", ".flac": "FLAC", ".ogg": "OGG", ".oga": "OGG"}.get(ext.lower(), "WAV")
+
+    def _merge_short_final_chunk_into_previous(self, chunk_paths: List[str]) -> None:
+        """If the last chunk is under ``_MIN_LAST_CHUNK_SECONDS``, merge it into the one before (or drop if empty)."""
+        if len(chunk_paths) < 2:
+            return
+
+        tail_path = chunk_paths[-1]
+        try:
+            tinfo = sf.info(tail_path)
+            tail_sec = tinfo.frames / float(tinfo.samplerate) if tinfo.samplerate else 0.0
+            tail_empty = tinfo.frames <= 0
+        except Exception:
+            tail_audio = AudioSegment.from_file(tail_path)
+            tail_sec = len(tail_audio) / 1000.0
+            tail_empty = len(tail_audio) == 0
+
+        if tail_sec >= self._MIN_LAST_CHUNK_SECONDS:
+            return
+
+        prev_path = chunk_paths[-2]
+        if tail_empty:
+            try:
+                os.remove(tail_path)
+            except OSError:
+                pass
+            chunk_paths.pop()
+            self.logger.debug("Removed empty final chunk file")
+            return
+
+        merged = False
+        try:
+            prev_data, sr_prev = sf.read(prev_path, dtype="float32", always_2d=True)
+            tail_data, sr_tail = sf.read(tail_path, dtype="float32", always_2d=True)
+            if sr_prev == sr_tail and prev_data.shape[1] == tail_data.shape[1]:
+                pinfo = sf.info(prev_path)
+                combined = np.concatenate((prev_data, tail_data), axis=0)
+                sf.write(
+                    prev_path,
+                    combined,
+                    sr_prev,
+                    subtype=(pinfo.subtype or "PCM_16"),
+                    format=self._soundfile_format_for_path(prev_path),
+                )
+                merged = True
+        except Exception as e:
+            self.logger.debug(f"Tail merge via SoundFile failed, using Pydub: {e}")
+
+        if not merged:
+            prev_seg = AudioSegment.from_file(prev_path)
+            tail_seg = AudioSegment.from_file(tail_path)
+            combined_seg = prev_seg + tail_seg
+            _, ext = os.path.splitext(prev_path)
+            fmt = ext.lstrip(".").lower() if ext else "wav"
+            if fmt == "m4a":
+                fmt = "mp4"
+            combined_seg.export(prev_path, format=fmt)
+
+        try:
+            os.remove(tail_path)
+        except OSError:
+            pass
+        chunk_paths.pop()
+        self.logger.info(f"Merged short final chunk ({tail_sec:.1f}s) into the previous segment")
 
     def __init__(self, chunk_duration_seconds: float, logger: logging.Logger = None):
         """
@@ -122,6 +188,8 @@ class AudioChunker:
                     pass
             return None
 
+        if chunk_paths:
+            self._merge_short_final_chunk_into_previous(chunk_paths)
         return chunk_paths if chunk_paths else None
 
     def _split_audio_pydub(self, input_path: str, output_dir: str) -> List[str]:
@@ -154,6 +222,8 @@ class AudioChunker:
             chunk.export(chunk_path, format=ext.lstrip("."))
             chunk_paths.append(chunk_path)
 
+        if chunk_paths:
+            self._merge_short_final_chunk_into_previous(chunk_paths)
         return chunk_paths
 
     def merge_chunks(self, chunk_paths: List[str], output_path: str) -> str:
