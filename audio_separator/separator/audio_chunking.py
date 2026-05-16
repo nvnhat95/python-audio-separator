@@ -219,7 +219,10 @@ class AudioChunker:
             self.logger.debug(
                 f"Exporting chunk {i + 1}/{num_chunks}: {start_ms / 1000:.1f}s - {end_ms / 1000:.1f}s to {chunk_path}"
             )
-            chunk.export(chunk_path, format=ext.lstrip("."))
+            fmt = ext.lstrip(".").lower()
+            if fmt == "m4a":
+                fmt = "mp4"
+            chunk.export(chunk_path, format=fmt)
             chunk_paths.append(chunk_path)
 
         if chunk_paths:
